@@ -37,17 +37,11 @@ from maa.define import RectType
 from maa.resource import Resource
 from maa.tasker import Tasker
 from maa.toolkit import AdbDevice, Toolkit
-from minitouchpy import (
-    MNT,
-    MNTEvATive7LogEventData,
-    MNTEvent,
-    MNTEventData,
-    MNTServerCommunicateType,
-)
 
 import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
+from ssm_playback import SSMPlayback
 import envcheck
 from util import *
 
@@ -63,11 +57,8 @@ SPECIAL_MODE = False
 # 默认曲目:简中客户端标题(曲库 musicTitle 下标 3)。也可写纯数字曲目 id,
 # 见 resolve_special_song()。换活动批次时改这里或 GUI 下拉。
 DEFAULT_SPECIAL_SONG = "[超高难易度 新SPECIAL] SENSENFUKOKU"
-OFFSET = {"up": 0, "down": 0, "move": 0, "wait": 0.0, "interval": 0.0}
 PHOTOGATE_LATENCY = 30
-DEFAULT_MOVE_SLICE_SIZE = 10
 MAX_FAILED_TIMES = 10
-CMD_SLICE_SIZE = 100
 
 config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 # Optional timing tuning via data/config.yml:
@@ -82,8 +73,7 @@ maatasker = Tasker()
 maacontroller: AdbController = None
 device: AdbDevice = None
 current_player: player.Player = None
-current_orientation: int = 0
-mnt: MNT = None
+current_playback: SSMPlayback = None
 all_songs: dict = BestdoriAPI.get_song_list()
 all_song_name_indexes: dict[str, str] = {
     list(filter(lambda title: title is not None, sinfo["musicTitle"]))[0]: sid
@@ -146,26 +136,7 @@ current_song_id: str = None
 _resolved_song_id: Optional[tuple] = None
 current_chart: Chart = None
 play_failed_times: int = 0
-callback_data: dict = {}
-callback_data_lock = threading.Lock()
-cmd_log_list: list[MNTEvATive7LogEventData] = []
-cmd_log_list_lock = threading.Lock()
 current_version = None
-
-
-def reset_callback_data():
-    global callback_data
-    callback_data = {
-        "wait": {"total": 0, "total_offset": 0.0},
-        "move": {"uncommited": 0, "total": 0, "total_offset": 0.0},
-        "up": {"uncommited": 0, "total": 0, "total_offset": 0.0},
-        "down": {"uncommited": 0, "total": 0, "total_offset": 0.0},
-        "interval": {"total": 0, "total_offset": 0.0},
-        "last_cmd_endtime": -1,
-    }
-
-
-reset_callback_data()
 
 
 # 选歌档位(以"历史最好成绩"判定,成就不会倒退):
@@ -616,42 +587,18 @@ def _stop_on_game_exit() -> bool:
     return bool(value) if isinstance(value, bool) else True
 
 
-def _release_minitouch() -> None:
-    """停掉 minitouch,并杀掉它的子进程、关掉管道。
-
-    关管道是必须的:minitouchpy 的 STDIO 读线程是**非 daemon** 线程,阻塞在
-    `p.stderr.readline()` 上。只要管道没关,解释器退出时就会一直等它 ——
-    进程永远退不掉,表现正是「脚本不自动停止」。
-    """
-    global mnt
-    target, mnt = mnt, None
-    if target is None:
-        return
-    try:
-        target.stop()
-    except Exception as e:
-        logging.debug("mnt.stop 失败: %s", e)
-    proc = getattr(target, "mnt_process", None)
-    if proc is None:
-        return
-    try:
-        proc.kill()
-    except Exception:
-        pass
-    for stream in (
-        getattr(proc, "stdin", None),
-        getattr(proc, "stdout", None),
-        getattr(proc, "stderr", None),
-    ):
+def _release_playback() -> None:
+    global current_playback
+    target, current_playback = current_playback, None
+    if target is not None:
         try:
-            if stream is not None:
-                stream.close()
-        except Exception:
-            pass
+            target.close()
+        except Exception as e:
+            logging.warning("关闭 SSM 播放进程失败: %s", e)
 
 
 def _shutdown(exit_code: int = 0, reason: str = "") -> None:
-    """统一收尾:停任务 → 释放 minitouch → 释放 MaaFramework → 刷日志 → 硬退出。
+    """统一收尾:停任务 → 释放 SSM 播放进程 → 释放 MaaFramework → 刷日志 → 硬退出。
 
     所有退出路径(正常结束 / 火罐不足 / 生命耗尽 / 失败超限 / 看门狗 / 异常)都
     汇聚到这里,保证资源一定被释放,且**一定真的退出**。用 os._exit 而不是
@@ -669,6 +616,7 @@ def _shutdown(exit_code: int = 0, reason: str = "") -> None:
         pass
 
     _force_post_stop()
+    _release_playback()
     # 给框架一点时间把任务/控制器线程收干净。这只是"体面退出"的余量, 拿不到也
     # 不影响正确性 —— 后面一定会 os._exit。实测 post_stop 会新投递一个 stop 任务,
     # 所以 running 往往要等到停止任务被消费才转 False, 别把等待设长。
@@ -682,8 +630,6 @@ def _shutdown(exit_code: int = 0, reason: str = "") -> None:
             break
         time.sleep(0.2)
     logging.debug("框架收尾等待 %.2fs", time.time() - t_wait)
-
-    _release_minitouch()
 
     # 显式放掉框架对象,触发 MaaControllerDestroy / MaaTaskerDestroy(正常析构会
     # 断开 adb 并关掉 maa.log);放不掉也无所谓 —— 下面马上硬退出。
@@ -1027,7 +973,7 @@ class SavePlayResult(CustomAction):
             if current_song_id is not None:
                 PlayRecord.create(
                     play_time=int(time.time()),
-                    play_offset=OFFSET,
+                    play_offset={"backend": "ssm", "photogate_ms": PHOTOGATE_LATENCY},
                     result=playresult,
                     succeed=succeed,
                     chart_id=current_song_id,
@@ -1080,8 +1026,7 @@ def _life_exhausted_on_screen(context) -> str:
 
     先做廉价亮度预检:弹窗标题区是白底深字(实测平均亮度 ~224),普通打歌
     画面该区域几乎不会是大块白,先滤掉绝大部分帧,只有预检通过才跑 OCR,
-    避免打歌中频繁 OCR 占用 CPU。检测耗时由调用方从 sleep 里补偿,不影响
-    打歌时机。
+    避免打歌中频繁 OCR 占用 CPU。触控计时在独立 Go 进程中执行。
     """
     try:
         screen = np.ascontiguousarray(
@@ -1349,7 +1294,7 @@ def _get_orientation():
 
 
 def save_song(name):
-    global current_song_name, current_song_id, current_chart, current_orientation
+    global current_song_name, current_song_id, current_chart
     current_song_name = name
     # 同名多条目(閃光 / オレンジ …)时标题查不到唯一 id,用识别阶段选定的那个。
     # 只有当记录与本次标题一致时才采信,避免跨首歌残留。
@@ -1357,16 +1302,16 @@ def save_song(name):
         current_song_id = _resolved_song_id[1]
     else:
         current_song_id = all_song_name_indexes[current_song_name]
-    # 歌名一确定就立刻打日志:下面 Chart()/notes_to_actions()/actions_to_MNTcmd()
-    # 是重活(要拉取谱面、把上万个 note 解算成触控指令,实测耗时 5~15s),
+    # 歌名一确定就立刻打日志:下面要拉取谱面并交给 SSM 生成触控指令,
     # 若把日志放在它们之后,GUI 要到"打歌即将开始"才收到歌名 —— 这正是
     # "选好歌后日志不显示歌名、打完才补上"的根因。用 INFO 级确保不被过滤。
     logging.info("Save song: {}".format(name))
     current_chart = Chart((current_song_id, DIFFICULTY), current_song_name)
-    current_chart.notes_to_actions(current_player.resolution, DEFAULT_MOVE_SLICE_SIZE)
-    current_orientation = _get_orientation()
-    current_chart.actions_to_MNTcmd(
-        (mnt.max_x, mnt.max_y), current_orientation, OFFSET, CMD_SLICE_SIZE
+    stats = current_playback.prepare(current_chart._chart_data)
+    logging.info(
+        "SSM ready: %s (#%s-%s), %s 触控动作, %s 时间点, %s 手指, 时长 %.1fs",
+        name, current_song_id, DIFFICULTY, stats["touch_count"],
+        stats["event_count"], stats["pointers"], stats["duration_ms"] / 1000,
     )
 
 
@@ -1420,144 +1365,48 @@ def _reload_photogate():
 def play_song(context=None):
     logging.info("Start play")
     _reload_photogate()
-    cmd_log_list.clear()
-    reset_callback_data()
-    wait_first = get_runtime_info(current_player.resolution)["wait_first"]
+    stats = current_playback.stats
     logging.info(
-        "打歌: %s (#%s-%s), 动作%s, photogate=%sms, 检测带y=%s-%s",
-        current_song_name,
-        current_song_id,
-        DIFFICULTY,
-        len(current_chart.actions),
-        PHOTOGATE_LATENCY,
-        wait_first["from"],
-        wait_first["to"],
+        "打歌: %s (#%s-%s), SSM 触控%s, photogate=%sms",
+        current_song_name, current_song_id, DIFFICULTY,
+        stats["touch_count"], PHOTOGATE_LATENCY,
     )
+    first_due = wait_first_note()
+    current_playback.start(first_due)
 
-    def _get_wait_time():
-        wait_for = 0.0
-        index = current_chart.actions_to_cmd_index
-        for action in current_chart.actions[index - CMD_SLICE_SIZE : index]:
-            if action["type"] == "wait":
-                wait_for += action["length"]
-        return wait_for
-
-    def _adjust_offset():
-        global callback_data
-        total_cost = 0.0
-        for type_ in ["up", "down", "move", "wait", "interval"]:
-            type_data = callback_data[type_]
-            total = type_data["total"]
-            if total != 0:
-                total_cost += type_data["total_offset"] - OFFSET[type_] * total
-                OFFSET[type_] = type_data["total_offset"] / total
-
-        current_chart._a2c_offset += total_cost
-        logging.debug("Adjust offset: {}".format(OFFSET))
-        logging.debug("Adjust _actions_to_cmd_offset: {}".format(total_cost))
-
-    wait_first_note()
-
-    # 打歌中生命耗尽检测:每 ≥LIFE_CHECK_INTERVAL 秒检查一次「演出失败」弹窗。
-    # 弹窗出现后游戏会一直等待,检测不用太密;检测耗时从本次 sleep 里扣除
-    # (仅在 sleep 预算充足时执行),保证下一批音符按谱面时间线准时发布,不会
-    # 因检测而整体提前/延后。命中即抛异常,由 Play 返回失败走 on_error。
-    last_life_check = 0.0
-    LIFE_CHECK_INTERVAL = 1.0  # 秒
-    # 生命检测统计。检测本身一直是生效的(实测 11/11 都处理了),但「卡在演出
-    # 失败弹窗」是偶发的,靠这几个数能直接区分成因:
-    #   starved 大   = 切片太密、sleep 预算不足,检测根本没机会跑
-    #   precheck 大  = 白底弹窗被亮度预检漏掉
-    #   checks 正常却没 hit = OCR 没读出来
-    life_stats = {"checks": 0, "hit": 0, "precheck": 0, "error": 0, "starved": 0}
-    starve_since = None
-
-    def _log_life_stats():
-        logging.info(
-            "生命检测汇总: 执行 %d 次(命中 %d), 亮度预检跳过 %d, OCR 异常 %d, 因切片过密跳过 %d",
-            life_stats["checks"],
-            life_stats["hit"],
-            life_stats["precheck"],
-            life_stats["error"],
-            life_stats["starved"],
-        )
-
-    # 自适应发布余量: 时间轴由服务端 wait 推进,python 必须在服务端把本批命令
-    # 执行完之前发布下一批。固定 3ms 余量在「平衡」电源计划下会被 CPU 频率
-    # 调节造成的偶发长停顿吃掉 → 服务端空转 → 之后所有音符按晚(偶发批量 miss)。
-    # 这里按实测的「构建+发布」耗时 EMA 自适应放大余量(3~60ms),快机不变、慢机自愈。
-    pub_margin_ms = 3.0
-    overrun_ema = 0.0
-    prev_sleep_end = None
-
-    while True:
-        now = time.perf_counter()
-        if prev_sleep_end is not None:
-            build_ms = (now - prev_sleep_end) * 1000.0
-            overrun = build_ms - pub_margin_ms
-            overrun_ema = 0.7 * overrun_ema + 0.3 * max(0.0, overrun)
-            pub_margin_ms = min(60.0, max(3.0, 3.0 + 2.0 * overrun_ema))
-            if pub_margin_ms >= 25.0 and int(pub_margin_ms) % 25 == 0:
-                logging.debug(
-                    "发布余量已提升到 %.0fms(主机抖动 EMA %.1fms)",
-                    pub_margin_ms, overrun_ema,
-                )
-        current_chart.command_builder.publish(mnt, block=False)
-        wait_time = _get_wait_time()
-        sleep_s = max(0, wait_time - pub_margin_ms) / 1000.0
-
-        now = time.perf_counter()
-        if context is not None and now - last_life_check >= LIFE_CHECK_INTERVAL:
-            if sleep_s >= 0.2:
-                starve_since = None
-                check_t0 = time.perf_counter()
-                life_result = _life_exhausted_on_screen(context)
+    # SSM schedules in a separate Go process. Screenshot/OCR monitoring here
+    # cannot hold up its touch loop or add delay to the remaining song.
+    last_life_check = time.perf_counter()
+    life_stats = {"checks": 0, "hit": 0, "no_match": 0, "precheck_rejected": 0, "error": 0}
+    finished = False
+    try:
+        while True:
+            message = current_playback.poll(0.05)
+            if message and message["event"] == "done":
+                if message.get("stopped"):
+                    raise RuntimeError("SSM 播放被中断")
+                finished = True
+                break
+            now = time.perf_counter()
+            if context is not None and now - last_life_check >= 1.0:
+                result = _life_exhausted_on_screen(context)
                 life_stats["checks"] += 1
-                # 注意:_life_exhausted_on_screen 返回的状态名与统计键名不同名
-                # (函数给 "precheck_rejected",统计键是 "precheck"),早期写法是
-                # 直接 life_stats[life_result] 索引 → 亮度预检一拒绝就 KeyError,
-                # 整首歌被判失败(2026-09-16 11:47 实跑:6 首在首音触发后约 30ms
-                # 全部被这条分支终结)。改显式分支,新增状态也不会再炸。
-                if life_result == "hit":
-                    life_stats["hit"] += 1
-                elif life_result == "precheck_rejected":
-                    life_stats["precheck"] += 1
-                elif life_result == "error":
-                    life_stats["error"] += 1
-                if life_result == "hit":
-                    logging.info("打歌中生命值耗尽,提前结束本次演出")
-                    _log_life_stats()
-                    raise LifeExhaustedDetected()
-                sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
+                life_stats[result] += 1
                 last_life_check = time.perf_counter()
-            else:
-                # 本批切片太密,扣掉检测耗时会把下一批发晚,只能跳过这一轮。
-                # 偶发跳过无妨,连续跳过就意味着这段时间的弹窗不会被发现。
-                life_stats["starved"] += 1
-                if starve_since is None:
-                    starve_since = now
-                elif now - starve_since >= 3.0:
-                    logging.warning(
-                        "生命检测已连续 %.1fs 无法执行(切片过密,sleep 预算不足),"
-                        "期间若弹出「演出失败」不会被发现",
-                        now - starve_since,
-                    )
-                    starve_since = now
-
-        time.sleep(sleep_s)
-        prev_sleep_end = time.perf_counter()
-
-        index = current_chart.actions_to_cmd_index
-        if current_chart.actions[index : index + CMD_SLICE_SIZE]:
-            with callback_data_lock:
-                _adjust_offset()
-                reset_callback_data()
-            current_chart.actions_to_MNTcmd(
-                (mnt.max_x, mnt.max_y), current_orientation, OFFSET, CMD_SLICE_SIZE
-            )
-        else:
-            break
-    _log_life_stats()
+                if result == "hit":
+                    logging.info("打歌中生命值耗尽,提前结束本次演出")
+                    raise LifeExhaustedDetected()
+    finally:
+        if not finished and current_playback is not None:
+            try:
+                current_playback.stop()
+            except Exception as e:
+                logging.warning("停止 SSM 播放失败: %s", e)
+        logging.info(
+            "生命检测汇总: 执行 %d 次(命中 %d), 亮度预检跳过 %d, OCR 异常 %d",
+            life_stats["checks"], life_stats["hit"],
+            life_stats["precheck_rejected"], life_stats["error"],
+        )
     time.sleep(2)
 
 
@@ -1729,9 +1578,6 @@ def wait_first_note():
                         change_score - prev_change, 1e-9
                     )
                     cross_t = prev_frame_t + frac * (frame_t - prev_frame_t)
-                    wait_ms = PHOTOGATE_LATENCY - (
-                        time.perf_counter() - cross_t
-                    ) * 1000.0
                     _maybe_log(
                         change_score,
                         band_avg,
@@ -1740,22 +1586,17 @@ def wait_first_note():
                         ),
                     )
                     _log_trigger(cross_t, change_score, "interp")
-                    time.sleep(max(0, wait_ms) / 1000)
-                    break
+                    return cross_t + PHOTOGATE_LATENCY / 1000
                 elif change_score >= CHANGE_THRESHOLD:
                     # Already above threshold on both frames: the entry happened
                     # at or before this frame; compensate the elapsed time.
-                    wait_ms = PHOTOGATE_LATENCY - (
-                        time.perf_counter() - frame_t
-                    ) * 1000.0
                     _maybe_log(
                         change_score,
                         band_avg,
                         "trigger(direct {:.2f})".format(change_score),
                     )
                     _log_trigger(frame_t, change_score, "direct")
-                    time.sleep(max(0, wait_ms) / 1000)
-                    break
+                    return frame_t + PHOTOGATE_LATENCY / 1000
             prev_change = change_score
             prev_frame_t = frame_t
             last_avg = band_avg
@@ -1825,54 +1666,8 @@ def init_maa():
     logging.info("MAA inited.")
 
 
-def mnt_callback(event: MNTEvent, data: MNTEventData):
-    global callback_data
-    if event == MNTEvent.EVATIVE7_LOG:
-        data: MNTEvATive7LogEventData = data
-
-        cmd = data.cmd
-        cost = data.cost
-
-        with cmd_log_list_lock:
-            cmd_log_list.append(data)
-        cmd_type = cmd.split(" ")[0]
-
-        callback_data_lock.acquire()
-
-        if (last_cmd_endtime := callback_data.get("last_cmd_endtime")) != -1:
-            callback_data["interval"]["total"] += 1
-            callback_data["interval"]["total_offset"] += (
-                data.start_time - last_cmd_endtime
-            )
-        callback_data["last_cmd_endtime"] = data.end_time
-        if cmd_type in ["w"]:
-            callback_data["wait"]["total"] += 1
-            callback_data["wait"]["total_offset"] += cost - int(cmd.split(" ")[-1])
-        elif cmd_type in ["u", "d", "m"]:
-            type_ = {
-                "u": "up",
-                "d": "down",
-                "m": "move",
-            }[cmd_type]
-            callback_data[type_]["uncommited"] += 1
-            callback_data[type_]["total"] += 1
-            callback_data[type_]["total_offset"] += cost
-        elif cmd_type in ["c"]:
-            total_uncommited = 0
-            for type_ in ["up", "down", "move"]:
-                total_uncommited += callback_data[type_]["uncommited"]
-
-            if total_uncommited != 0:
-                for type_ in ["up", "down", "move"]:
-                    callback_data[type_]["total_offset"] += cost * (
-                        callback_data[type_]["uncommited"] / total_uncommited
-                    )
-                    callback_data[type_]["uncommited"] = 0
-        callback_data_lock.release()
-
-
-def init_player_and_mnt():
-    global current_player, mnt
+def init_player_and_playback():
+    global current_player, current_playback
 
     extra_config = device.config["extras"]
     if "mumu" in extra_config.keys():
@@ -1890,16 +1685,8 @@ def init_player_and_mnt():
     index = extra_config["index"]
 
     current_player = player.Player(type_, Path(path), index)
-    mnt = MNT(
-        device.address,
-        type_="EvATive7",
-        communicate_type=MNTServerCommunicateType.STDIO,
-        mnt_asset_path=Path("./assets/minitouch_EvATive7"),
-        callback=mnt_callback,
-        adb_executor=str(device.adb_path.absolute()),
-    )
-
-    logging.info("Mumu and MNT inited.")
+    current_playback = SSMPlayback(device.address, current_player.resolution)
+    logging.info("SSM inited: Go 触控生成 + scrcpy 控制 + 绝对时间调度")
 
 
 def configure_log():
@@ -2240,7 +2027,7 @@ def _main_impl():
     LIVEMODE = args.livemode
     MIN_LIVEBOOST = args.liveboost
     init_maa()
-    init_player_and_mnt()
+    init_player_and_playback()
     if SPECIAL_MODE:
         _prepare_special_song(args.special_song)
     _log_environment()
@@ -2254,8 +2041,8 @@ def _main_impl():
     except Exception as e:
         logging.exception("任务异常结束: %s", e)
     finally:
-        # 收尾只有这一条路径:释放 minitouch/MAA 并硬退出(_shutdown 不返回)。
-        # 用 finally 保证异常路径也走收尾 —— 旧写法 mnt.stop() 在异常时会被跳过。
+        # 收尾只有这一条路径:释放 SSM/MAA 并硬退出(_shutdown 不返回)。
+        # finally 保证异常路径也关闭播放进程。
         logging.debug("Ready to exit")
         _shutdown(0, _exit_reason or "任务结束")
 

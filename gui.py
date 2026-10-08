@@ -1164,7 +1164,8 @@ class AutodoriGUI:
     # 与「全部输出」形成明显差异。
     _KEEP = (
         "MAA inited",
-        "Mumu and MNT inited",
+        "SSM inited",
+        "SSM ready",
         "Save song",
         "Start play",
         ">>> ",

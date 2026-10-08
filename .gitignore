@@ -646,3 +646,13 @@ _diag_maa.py
 # ---- 会话记忆(本地) ----
 # 跨会话的工作笔记,含内部排查细节与临时路径,不进公开仓库。
 .workbuddy/
+
+# Local Go toolchain and SSM playback builds
+.tools/
+assets/ssm/ssm-playback*
+playback/ssm/**/res.json
+playback/ssm/**/out.json
+!playback/ssm/config/
+!playback/ssm/config/*.go
+!playback/ssm/log/
+!playback/ssm/log/*.go

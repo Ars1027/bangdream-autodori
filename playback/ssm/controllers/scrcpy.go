@@ -1,0 +1,345 @@
+// Copyright (C) 2024, 2025 kvarenzn
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package controllers
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"math/rand"
+	"net"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/kvarenzn/ssm/adb"
+	"github.com/kvarenzn/ssm/common"
+	"github.com/kvarenzn/ssm/config"
+	"github.com/kvarenzn/ssm/log"
+	"github.com/kvarenzn/ssm/stage"
+)
+
+type ScrcpyController struct {
+	device    *adb.Device
+	sessionID string
+
+	listener      net.Listener
+	videoSocket   net.Conn
+	controlSocket net.Conn
+
+	width   int
+	height  int
+	codecID string
+
+	mu       sync.Mutex
+	cRunning bool
+	vRunning bool
+}
+
+func NewScrcpyController(device *adb.Device) *ScrcpyController {
+	return &ScrcpyController{
+		device:    device,
+		sessionID: fmt.Sprintf("%08x", rand.Int31()),
+	}
+}
+
+const testFromPort = 27188
+const testToPort = 28188
+
+func tryListen(host string, port int) (net.Listener, int, error) {
+	for port <= testToPort {
+		addr := fmt.Sprintf("%s:%d", host, port)
+		listen, err := net.Listen("tcp", addr)
+		if err == nil {
+			return listen, port, nil
+		}
+
+		port++
+	}
+	return nil, 0, fmt.Errorf("no available port in range %d-%d", testFromPort, testToPort)
+}
+
+func readn(r io.Reader, buf []byte) error {
+	_, err := io.ReadFull(r, buf)
+	return err
+}
+
+func (c *ScrcpyController) Open(filepath string, version string) error {
+	listener, port, err := tryListen("localhost", testFromPort)
+	if err != nil {
+		return err
+	}
+	c.listener = listener
+	log.Debugf("Listening at localhost:%d", port)
+
+	localName := fmt.Sprintf("localabstract:scrcpy_%s", c.sessionID)
+	err = c.device.Forward(localName, fmt.Sprintf("tcp:%d", port), true, false)
+	if err != nil {
+		return err
+	}
+	log.Debugf("ADB reverse socket `%s` created.", localName)
+
+	f, err := os.Open(filepath)
+	if err != nil {
+		return err
+	}
+
+	log.Debugln("`scrcpy-server` loaded.")
+
+	if err := c.device.Push(f, "/data/local/tmp/scrcpy-server.jar"); err != nil {
+		return err
+	}
+
+	log.Debugln("`scrcpy-server` pushed to gaming device.")
+
+	go func() {
+		result, err := c.device.Sh(
+			"CLASSPATH=/data/local/tmp/scrcpy-server.jar",
+			"app_process",
+			"/",
+			"com.genymobile.scrcpy.Server",
+			version,
+			fmt.Sprintf("scid=%s", c.sessionID), // session id
+			"log_level=warn",                    // log level
+			"audio=false",                       // disable audio sync
+			"clipboard_autosync=false",          // disable clipboard
+			"video_bit_rate=100000",             // very low bitrate: video is not needed for playback
+		)
+		if err != nil {
+			// Not fatal: closing the listener makes Open return an error
+			// instead of the whole program exiting.
+			log.Warnf("failed to start `scrcpy-server`: %v", err)
+			listener.Close()
+			return
+		}
+
+		log.Debugln(result)
+	}()
+
+	videoSocket, err := listener.Accept()
+	if err != nil {
+		return err
+	}
+	c.videoSocket = videoSocket
+
+	log.Debugln("Video socket accepted.")
+
+	controlSocket, err := listener.Accept()
+	if err != nil {
+		return err
+	}
+	c.controlSocket = controlSocket
+
+	log.Debugln("Control socket accepted.")
+
+	// Wait for scrcpy-server to finish initialization on the device
+	time.Sleep(500 * time.Millisecond)
+
+	err = c.device.KillReverseForward(localName)
+	if err != nil {
+		return err
+	}
+
+	log.Debugf("ADB reverse socket `%s` removed.", localName)
+
+	deviceName := make([]byte, 64)
+	if err := readn(videoSocket, deviceName); err != nil {
+		return fmt.Errorf("read device name: %w", err)
+	}
+
+	buf := make([]byte, 4)
+	if err := readn(videoSocket, buf); err != nil {
+		return fmt.Errorf("read codec id: %w", err)
+	}
+	c.codecID = string(buf)
+
+	if err := readn(videoSocket, buf); err != nil {
+		return fmt.Errorf("read width: %w", err)
+	}
+	c.width = int(binary.BigEndian.Uint32(buf))
+
+	if err := readn(videoSocket, buf); err != nil {
+		return fmt.Errorf("read height: %w", err)
+	}
+	c.height = int(binary.BigEndian.Uint32(buf))
+
+	c.cRunning = true
+	c.vRunning = true
+
+	go func() {
+		msgTypeBuf := make([]byte, 1)
+		sizeBuf := make([]byte, 4)
+		for {
+			c.mu.Lock()
+			running := c.cRunning
+			c.mu.Unlock()
+			if !running {
+				break
+			}
+
+			if err := readn(controlSocket, msgTypeBuf); err != nil {
+				break
+			}
+
+			if err := readn(controlSocket, sizeBuf); err != nil {
+				break
+			}
+
+			size := binary.BigEndian.Uint32(sizeBuf)
+			bodyBuf := make([]byte, size)
+			if err := readn(controlSocket, bodyBuf); err != nil {
+				break
+			}
+		}
+
+		c.mu.Lock()
+		c.cRunning = false
+		c.mu.Unlock()
+	}()
+
+	go func() {
+		ptsBuf := make([]byte, 8)
+		sizeBuf := make([]byte, 4)
+		for {
+			c.mu.Lock()
+			running := c.vRunning
+			c.mu.Unlock()
+			if !running {
+				break
+			}
+
+			if err := readn(videoSocket, ptsBuf); err != nil {
+				break
+			}
+
+			if err := readn(videoSocket, sizeBuf); err != nil {
+				break
+			}
+			size := binary.BigEndian.Uint32(sizeBuf)
+			// Frames are captured by autodori's emulator IPC, as before.
+			if _, err := io.CopyN(io.Discard, videoSocket, int64(size)); err != nil {
+				break
+			}
+		}
+
+		c.mu.Lock()
+		c.vRunning = false
+		c.mu.Unlock()
+	}()
+
+	return nil
+}
+
+func (c *ScrcpyController) Encode(action common.TouchAction, x, y int32, pointerID uint64) []byte {
+	data := make([]byte, 32)
+	data[0] = 2 // type: SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
+	data[1] = byte(action)
+	binary.BigEndian.PutUint64(data[2:], pointerID)
+	binary.BigEndian.PutUint32(data[10:], uint32(x))
+	binary.BigEndian.PutUint32(data[14:], uint32(y))
+	binary.BigEndian.PutUint16(data[18:], uint16(c.width))
+	binary.BigEndian.PutUint16(data[20:], uint16(c.height))
+	binary.BigEndian.PutUint16(data[22:], 0xffff)
+	binary.BigEndian.PutUint32(data[24:], 1) // AMOTION_EVENT_BUTTON_PRIMARY
+	binary.BigEndian.PutUint32(data[28:], 1) // AMOTION_EVENT_BUTTON_PRIMARY
+	return data
+}
+
+func (c *ScrcpyController) touch(action common.TouchAction, x, y int32, pointerID uint64) {
+	c.Send(c.Encode(action, x, y, pointerID))
+}
+
+func (c *ScrcpyController) Down(pointerID uint64, x, y int) {
+	c.touch(common.TouchDown, int32(x), int32(y), pointerID)
+}
+
+func (c *ScrcpyController) Move(pointerID uint64, x, y int) {
+	c.touch(common.TouchMove, int32(x), int32(y), pointerID)
+}
+
+func (c *ScrcpyController) Up(pointerID uint64, x, y int) {
+	c.touch(common.TouchUp, int32(x), int32(y), pointerID)
+}
+
+func (c *ScrcpyController) Close() error {
+	c.mu.Lock()
+	c.cRunning = false
+	c.vRunning = false
+	c.mu.Unlock()
+
+	if err := c.videoSocket.Close(); err != nil {
+		return err
+	}
+
+	if err := c.controlSocket.Close(); err != nil {
+		return err
+	}
+
+	return c.listener.Close()
+}
+
+func (c *ScrcpyController) Preprocess(rawEvents common.RawVirtualEvents, turnRight bool, dc *config.DeviceConfig, calc stage.JudgeLinePositionCalculator) []common.ViscousEventItem {
+	width, height := float64(dc.Height), float64(dc.Width)
+	x1, x2, yy := calc(width, height)
+	mapper := func(x, y float64) (int, int) {
+		return int(math.Round(x1 + (x2-x1)*x)), int(math.Round(yy - (yy-height/2)*y))
+	}
+
+	result := []common.ViscousEventItem{}
+	currentFingers := make([]bool, 0)
+	for _, events := range rawEvents {
+		var data []byte
+		for _, event := range events.Events {
+			if event.PointerID >= len(currentFingers) {
+				newSlice := make([]bool, event.PointerID+1)
+				copy(newSlice, currentFingers)
+				currentFingers = newSlice
+			}
+
+			x, y := mapper(event.X, event.Y)
+			switch event.Action {
+			case common.TouchDown:
+				if currentFingers[event.PointerID] {
+					log.Fatalf("pointer `%d` is already on screen", event.PointerID)
+				}
+				currentFingers[event.PointerID] = true
+			case common.TouchMove:
+				if !currentFingers[event.PointerID] {
+					log.Fatalf("pointer `%d` is not on screen", event.PointerID)
+				}
+			case common.TouchUp:
+				if !currentFingers[event.PointerID] {
+					log.Fatalf("pointer `%d` is not on screen", event.PointerID)
+				}
+				currentFingers[event.PointerID] = false
+			default:
+				log.Fatalf("unknown touch action: %d\n", event.Action)
+			}
+
+			data = append(data, c.Encode(event.Action, int32(x), int32(y), uint64(event.PointerID))...)
+		}
+
+		result = append(result, common.ViscousEventItem{
+			Timestamp: events.Timestamp,
+			Data:      data,
+		})
+	}
+
+	return result
+}
+
+func (c *ScrcpyController) Send(data []byte) {
+	sent := 0
+	for sent < len(data) {
+		n, err := c.controlSocket.Write(data[sent:])
+		if err != nil {
+			log.Fatalln("Failed to send control data through control socket:", err)
+		}
+		if n == 0 {
+			log.Fatalln("Control socket write returned 0 bytes")
+		}
+		sent += n
+	}
+}

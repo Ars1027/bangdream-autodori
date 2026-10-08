@@ -34,6 +34,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: playback/ssm/go.sum
+
       - name: Run build script
         run: |
           pip install pyinstaller
