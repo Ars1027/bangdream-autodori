@@ -8,20 +8,16 @@ import (
 	"testing"
 )
 
-func generated(t *testing.T, notes []TimedNote) common.RawVirtualEvents {
+func generated(t *testing.T, chart Chart) common.RawVirtualEvents {
 	t.Helper()
-	chart, err := FromAutodori(notes)
-	if err != nil {
-		t.Fatal(err)
-	}
 	raw, _ := GenerateHumanizedTouchEvent(AutodoriTouchConfig(), HumanizeConfig{GreatOffsetMs: 10}, chart)
 	return raw
 }
 
 func TestAutodoriLongEndAndSimultaneousTap(t *testing.T) {
-	raw := generated(t, []TimedNote{
-		{Type: "Long", Connections: []Connection{{Time: 0, Lane: 1}, {Time: 1000, Lane: 1}}},
-		{Type: "Single", Time: 1000, Lane: 4},
+	raw := generated(t, Chart{
+		newStar(1, 1.0/6, 1.0/6).chainsAfter(newStar(0, 1.0/6, 1.0/6).markAsTap().markAsHead()).markAsEnd(),
+		newStar(1, 4.0/6, 1.0/6).markAsTap(),
 	})
 	var longPointer, tapPointer int
 	var moved, released bool
@@ -50,7 +46,9 @@ func TestAutodoriLongEndAndSimultaneousTap(t *testing.T) {
 }
 
 func TestAutodoriTouchingTapIntervalsConflict(t *testing.T) {
-	raw := generated(t, []TimedNote{{Type: "Single", Time: 0, Lane: 0}, {Type: "Single", Time: 10, Lane: 1}})
+	raw := generated(t, Chart{
+		newStar(0, 0, 1.0/6).markAsTap(), newStar(0.010, 1.0/6, 1.0/6).markAsTap(),
+	})
 	var pointers []int
 	for _, item := range raw {
 		for _, e := range item.Events {
@@ -65,9 +63,9 @@ func TestAutodoriTouchingTapIntervalsConflict(t *testing.T) {
 }
 
 func TestAutodoriSixSimultaneousNotes(t *testing.T) {
-	var notes []TimedNote
+	var notes Chart
 	for lane := 0; lane < 6; lane++ {
-		notes = append(notes, TimedNote{Type: "Single", Time: 500, Lane: float64(lane)})
+		notes = append(notes, newStar(0.5, float64(lane)/6, 1.0/6).markAsTap())
 	}
 	raw := generated(t, notes)
 	down := map[int]bool{}
@@ -82,9 +80,10 @@ func TestAutodoriSixSimultaneousNotes(t *testing.T) {
 }
 
 func TestAutodoriSlideZeroLengthAndHiddenGeometry(t *testing.T) {
-	raw := generated(t, []TimedNote{{Type: "Slide", Connections: []Connection{
-		{Time: 0, Lane: 0}, {Time: 500, Lane: 2}, {Time: 500, Lane: 3}, {Time: 1000, Lane: 6, Flick: true},
-	}}})
+	head := newStar(0, 0, 1.0/6).markAsTap().markAsHead()
+	middle := newStar(0.5, 2.0/6, 1.0/6).chainsAfter(head)
+	middle = newStar(0.5, 3.0/6, 1.0/6).chainsAfter(middle)
+	raw := generated(t, Chart{newStar(1, 1, 1.0/6).chainsAfter(middle).flickToIfOk(true, 90).markAsEnd()})
 	var at500 []float64
 	var lastUp int64
 	for _, item := range raw {

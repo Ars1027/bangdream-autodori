@@ -1,4 +1,4 @@
-"""Bridge to the vendored SSM Go touch generator and playback scheduler."""
+"""Load local BMS charts through SSM's Go parser and playback scheduler."""
 
 import json
 import logging
@@ -10,13 +10,32 @@ import time
 from pathlib import Path
 
 
+def project_root():
+    return (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parent.parent
+    )
+
+
+def find_bms_chart(song_id, difficulty, charts_dir=None):
+    """Use SSM GUI's musicscore/song-id/difficulty lookup, in sorted order."""
+    root = Path(charts_dir) if charts_dir is not None else project_root() / "data" / "ssm" / "charts"
+    sid = int(song_id)
+    if difficulty not in {"easy", "normal", "hard", "expert", "special"}:
+        raise ValueError("不支持的谱面难度: %s" % difficulty)
+    matches = sorted(root.glob("musicscore*/%03d/*_%s.txt" % (sid, difficulty)))
+    if not matches:
+        raise FileNotFoundError(
+            "本地 BMS 谱面缺失: #%s-%s，目录 %s；请从 SSM GUI release 导入对应谱面"
+            % (sid, difficulty, root)
+        )
+    return matches[0].resolve()
+
+
 class SSMPlayback:
     def __init__(self, serial, resolution, *, offline=False):
-        base = (
-            Path(sys.executable).resolve().parent
-            if getattr(sys, "frozen", False)
-            else Path(__file__).resolve().parent.parent
-        )
+        base = project_root()
         assets = base / "assets" / "ssm"
         executable = assets / ("ssm-playback.exe" if sys.platform == "win32" else "ssm-playback")
         if not executable.is_file():
@@ -88,8 +107,11 @@ class SSMPlayback:
             if message and message["event"] == event:
                 return message
 
-    def prepare(self, timed_notes):
-        self._send("prepare", notes=timed_notes)
+    def prepare(self, chart_path):
+        chart_path = Path(chart_path).resolve()
+        if not chart_path.is_file():
+            raise FileNotFoundError("本地 BMS 谱面不存在: %s" % chart_path)
+        self._send("prepare", chart_path=str(chart_path))
         self.stats = self._wait_for("ready", 30)
         return self.stats
 

@@ -40,8 +40,8 @@ from maa.toolkit import AdbDevice, Toolkit
 
 import player
 from api import BestdoriAPI
-from chart import Chart, PlayRecord
-from ssm_playback import SSMPlayback
+from chart import PlayRecord
+from ssm_playback import SSMPlayback, find_bms_chart
 import envcheck
 from util import *
 
@@ -134,7 +134,6 @@ current_song_id: str = None
 # SongRecognition 选定的 (标题, 曲目 id)。同名多条目时标题无法反查唯一 id,
 # 由识别阶段写入、紧随其后的 SaveSong 动作读取(PipelineTask 内同线程顺序执行)。
 _resolved_song_id: Optional[tuple] = None
-current_chart: Chart = None
 play_failed_times: int = 0
 current_version = None
 
@@ -1294,7 +1293,7 @@ def _get_orientation():
 
 
 def save_song(name):
-    global current_song_name, current_song_id, current_chart
+    global current_song_name, current_song_id
     current_song_name = name
     # 同名多条目(閃光 / オレンジ …)时标题查不到唯一 id,用识别阶段选定的那个。
     # 只有当记录与本次标题一致时才采信,避免跨首歌残留。
@@ -1302,15 +1301,15 @@ def save_song(name):
         current_song_id = _resolved_song_id[1]
     else:
         current_song_id = all_song_name_indexes[current_song_name]
-    # 歌名一确定就立刻打日志:下面要拉取谱面并交给 SSM 生成触控指令,
+    # 歌名一确定就立刻打日志:下面要读取本地谱面并交给 SSM 生成触控指令,
     # 若把日志放在它们之后,GUI 要到"打歌即将开始"才收到歌名 —— 这正是
     # "选好歌后日志不显示歌名、打完才补上"的根因。用 INFO 级确保不被过滤。
     logging.info("Save song: {}".format(name))
-    current_chart = Chart((current_song_id, DIFFICULTY), current_song_name)
-    stats = current_playback.prepare(current_chart._chart_data)
+    chart_path = find_bms_chart(current_song_id, DIFFICULTY)
+    stats = current_playback.prepare(chart_path)
     logging.info(
-        "SSM ready: %s (#%s-%s), %s 触控动作, %s 时间点, %s 手指, 时长 %.1fs",
-        name, current_song_id, DIFFICULTY, stats["touch_count"],
+        "SSM ready: %s (#%s-%s), 本地 BMS %s, %s 触控动作, %s 时间点, %s 手指, 时长 %.1fs",
+        name, current_song_id, DIFFICULTY, chart_path.name, stats["touch_count"],
         stats["event_count"], stats["pointers"], stats["duration_ms"] / 1000,
     )
 

@@ -17,13 +17,14 @@ import (
 	"github.com/kvarenzn/ssm/common"
 	"github.com/kvarenzn/ssm/controllers"
 	"github.com/kvarenzn/ssm/engine"
+	"github.com/kvarenzn/ssm/log"
 	"github.com/kvarenzn/ssm/scores"
 )
 
 type request struct {
-	Command        string             `json:"command"`
-	Notes          []scores.TimedNote `json:"notes"`
-	FirstDueUnixNS int64              `json:"first_due_unix_ns"`
+	Command        string `json:"command"`
+	ChartPath      string `json:"chart_path"`
+	FirstDueUnixNS int64  `json:"first_due_unix_ns"`
 }
 
 var outputMu sync.Mutex
@@ -41,6 +42,24 @@ func report(event string, fields map[string]any) {
 type offlineController struct{}
 
 func (offlineController) Send([]byte) {}
+
+func loadBMS(path string) (chart scores.Chart, err error) {
+	// SSM GUI also catches FatalErr at its playback boundary. Keep parser
+	// behavior intact, but report the rejected file to the Python caller.
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(log.FatalErr); !ok {
+				panic(r)
+			}
+			err = fmt.Errorf("SSM BMS 解析失败: %s；请查看 SSM 解析日志", path)
+		}
+	}()
+	text, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read local BMS chart %q: %w", path, err)
+	}
+	return scores.ParseBMS(string(text)), nil
+}
 
 func run() error {
 	serial := flag.String("serial", "", "ADB serial selected by MaaFramework")
@@ -101,7 +120,7 @@ func run() error {
 		switch req.Command {
 		case "prepare":
 			stop()
-			chart, err := scores.FromAutodori(req.Notes)
+			chart, err := loadBMS(req.ChartPath)
 			if err != nil {
 				return err
 			}
@@ -121,7 +140,8 @@ func run() error {
 			if !*offline {
 				scrcpy.ResetTouch()
 			}
-			report("ready", map[string]any{"event_count": len(events), "touch_count": count,
+			report("ready", map[string]any{"chart_path": req.ChartPath, "note_count": len(chart),
+				"event_count": len(events), "touch_count": count,
 				"pointers": pointers, "first_ms": events[0].Timestamp,
 				"duration_ms": events[len(events)-1].Timestamp - events[0].Timestamp})
 		case "play":

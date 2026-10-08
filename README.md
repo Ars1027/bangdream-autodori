@@ -86,7 +86,7 @@
 
 ### 方式二:源码运行(适合开发者/自行调参)
 
-当前 `feat/ssm-playback` 分支使用 SSM Go 触控和计时核心。源码启动前执行 `python build_ssm.py`，首次构建需要 Go 1.25 或更高版本。详见 [SSM 播放说明](docs/ssm_playback.md)。
+当前 `feat/ssm-playback` 分支读取本地 BMS 谱面，并使用 SSM Go 解析、触控和计时核心。源码启动前执行 `python build_ssm.py`，首次构建需要 Go 1.25 或更高版本；再从已有 SSM GUI release 导入谱面。详见 [SSM 播放说明](docs/ssm_playback.md)。
 
 ```bash
 git clone -b feat/ssm-playback https://github.com/Ars1027/bangdream-autodori
@@ -95,6 +95,7 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 python build_ssm.py      # 编译 SSM 播放核心(需要 Go 1.25+)
+python import_ssm_charts.py "D:\ssm-gui-windows-3.7.0-full-amd64"  # 导入本地谱面
 python gui.py            # 启动 GUI
 # 或命令行直接跑:
 python src/autodori.py --mode main --difficulty expert --livemode freelive

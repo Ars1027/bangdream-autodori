@@ -134,6 +134,10 @@ shutil.copytree(
         ["misc", "MaaCommonAssets"] if os.path.basename(dirname) else []
     ),
 )
+# 本地导入的谱面随发布包保留；没有导入时由用户复制到相同的数据目录。
+charts_source = os.path.join(current_dir, "data", "ssm", "charts")
+if os.path.isdir(charts_source):
+    shutil.copytree(charts_source, os.path.join(dist_dir, "data", "ssm", "charts"))
 # 复制OCR模型
 ocr_model_path = os.path.join(assets_dest_path, "resource", "model", "ocr")
 ocr_src_v4 = os.path.join(current_dir, "assets", "MaaCommonAssets", "OCR", "ppocr_v4", "zh_cn")
