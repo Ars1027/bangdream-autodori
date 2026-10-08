@@ -70,6 +70,16 @@ class Chart:
         return time_ * 1000
 
     def _process_time_chart(self):
+        # A long/slide can cross BPM changes listed after its head. Build the
+        # complete timeline first, then convert every note and connection.
+        self._bpms = sorted(
+            (
+                (note["bpm"], note["beat"])
+                for note in self._chart_data
+                if note["type"] == "BPM"
+            ),
+            key=lambda bpm: bpm[1],
+        )
         checkpoint_index = -1
         note_index = -1
 
@@ -87,9 +97,7 @@ class Chart:
             note_type = note["type"]
 
             if note_type == "BPM":
-                bpm = note["bpm"]
-                beat = note["beat"]
-                self._bpms.append((bpm, beat))
+                continue
             elif note_type in ["Single", "Directional"]:
                 note["time"] = self._beat_to_time(note["beat"])
                 note["checkpoint_index"] = get_checkpoint_index()
