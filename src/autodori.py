@@ -50,6 +50,7 @@ from api import BestdoriAPI
 from chart import Chart, PlayRecord
 from challenge import ChallengeCPRecognition, SelectChallengeCP, challenge_overrides, click
 import envcheck
+from timing_diagnostics import save_report as save_timing_report
 from util import *
 
 MIN_LIVEBOOST = 1
@@ -1803,11 +1804,16 @@ def play_song(context=None):
     pub_margin_ms = 3.0
     overrun_ema = 0.0
     prev_sleep_end = None
+    previous_publish_start = None
+    previous_publish_end = None
+    first_publish_start = None
+    timing_rows = []
 
     while True:
         now = time.perf_counter()
         if prev_sleep_end is not None:
             build_ms = (now - prev_sleep_end) * 1000.0
+            timing_rows[-1]["next_prepare_ms"] = build_ms
             overrun = build_ms - pub_margin_ms
             overrun_ema = 0.7 * overrun_ema + 0.3 * max(0.0, overrun)
             pub_margin_ms = min(60.0, max(3.0, 3.0 + 2.0 * overrun_ema))
@@ -1816,10 +1822,27 @@ def play_song(context=None):
                     "发布余量已提升到 %.0fms(主机抖动 EMA %.1fms)",
                     pub_margin_ms, overrun_ema,
                 )
+        action_start = max(0, current_chart.actions_to_cmd_index - CMD_SLICE_SIZE)
+        action_end = min(current_chart.actions_to_cmd_index, len(current_chart.actions))
+        publish_start = time.perf_counter()
+        if first_publish_start is None:
+            first_publish_start = publish_start
+        if previous_publish_start is not None:
+            timing_rows[-1]["next_publish_gap_ms"] = (
+                publish_start - previous_publish_end
+            ) * 1000.0
+            timing_rows[-1]["next_pub_minus_nominal_wait_ms"] = (
+                (publish_start - previous_publish_start) * 1000.0
+                - timing_rows[-1]["wait_ms"]
+            )
         current_chart.command_builder.publish(mnt, block=False)
+        publish_end = time.perf_counter()
+        previous_publish_start = publish_start
+        previous_publish_end = publish_end
         wait_time = _get_wait_time()
         sleep_s = max(0, wait_time - pub_margin_ms) / 1000.0
 
+        life_check_ms = 0.0
         now = time.perf_counter()
         if context is not None and now - last_life_check >= LIFE_CHECK_INTERVAL:
             if sleep_s >= 0.2:
@@ -1842,7 +1865,9 @@ def play_song(context=None):
                     logging.info("打歌中生命值耗尽,提前结束本次演出")
                     _log_life_stats()
                     raise LifeExhaustedDetected()
-                sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
+                check_elapsed_s = time.perf_counter() - check_t0
+                life_check_ms = check_elapsed_s * 1000.0
+                sleep_s = max(0.0, sleep_s - check_elapsed_s)
                 last_life_check = time.perf_counter()
             else:
                 # 本批切片太密,扣掉检测耗时会把下一批发晚,只能跳过这一轮。
@@ -1858,8 +1883,26 @@ def play_song(context=None):
                     )
                     starve_since = now
 
+        sleep_start = time.perf_counter()
         time.sleep(sleep_s)
         prev_sleep_end = time.perf_counter()
+        timing_rows.append(
+            {
+                "batch": len(timing_rows) + 1,
+                "action_start": action_start,
+                "action_end": action_end,
+                "elapsed_ms": (publish_start - first_publish_start) * 1000.0,
+                "wait_ms": wait_time,
+                "margin_ms": pub_margin_ms,
+                "publish_ms": (publish_end - publish_start) * 1000.0,
+                "life_check_ms": life_check_ms,
+                "sleep_requested_ms": sleep_s * 1000.0,
+                "sleep_actual_ms": (prev_sleep_end - sleep_start) * 1000.0,
+                "sleep_overshoot_ms": (
+                    prev_sleep_end - sleep_start - sleep_s
+                ) * 1000.0,
+            }
+        )
 
         index = current_chart.actions_to_cmd_index
         if current_chart.actions[index : index + CMD_SLICE_SIZE]:
@@ -1872,6 +1915,25 @@ def play_song(context=None):
         else:
             break
     _log_life_stats()
+    try:
+        timing_path, timing_stats = save_timing_report(
+            timing_rows, current_song_id, DIFFICULTY
+        )
+        logging.info(
+            "打歌时序: %d 批, 睡眠超时≥10ms %d 批(最大 %.1fms), "
+            "下批准备≥10ms %d 批(最大 %.1fms), 发布≥10ms %d 批, "
+            "下批发布晚于名义等待≥10ms %d 批; 逐批明细: %s",
+            timing_stats["batches"],
+            timing_stats["oversleep"],
+            timing_stats["max_oversleep_ms"],
+            timing_stats["prepare"],
+            timing_stats["max_prepare_ms"],
+            timing_stats["publish"],
+            timing_stats["nominal_gap"],
+            timing_path,
+        )
+    except Exception:
+        logging.exception("保存打歌时序明细失败")
     time.sleep(2)
 
 
