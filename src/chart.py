@@ -175,11 +175,14 @@ class Chart:
             result = []
             cur = 0
             while True:
-                if num - cur > part_size:
+                remaining = num - cur
+                # VORACITY 的 300ms 段会多出约 1e-11ms;并入末片,避免
+                # 生成释放后的旧 move,覆盖同刻复用手指的新音符坐标。
+                if remaining > part_size + 1e-6:
                     result.append((cur, part_size))
                     cur += part_size
                 else:
-                    result.append((cur, num - cur))
+                    result.append((cur, remaining))
                     break
             return result
 
