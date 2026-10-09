@@ -50,7 +50,7 @@ from api import BestdoriAPI
 from chart import Chart, PlayRecord
 from challenge import ChallengeCPRecognition, SelectChallengeCP, challenge_overrides, click
 import envcheck
-from timing_diagnostics import save_report as save_timing_report
+from timing_diagnostics import save_device_report, save_report as save_timing_report
 from util import *
 
 MIN_LIVEBOOST = 1
@@ -1735,7 +1735,8 @@ def _reload_photogate():
 def play_song(context=None):
     logging.info("Start play")
     _reload_photogate()
-    cmd_log_list.clear()
+    with cmd_log_list_lock:
+        cmd_log_list.clear()
     reset_callback_data()
     wait_first = get_runtime_info(current_player.resolution)["wait_first"]
     logging.info(
@@ -1808,6 +1809,8 @@ def play_song(context=None):
     previous_publish_end = None
     first_publish_start = None
     timing_rows = []
+    sent_batches = []
+    command_start = 0
 
     while True:
         now = time.perf_counter()
@@ -1835,8 +1838,13 @@ def play_song(context=None):
                 (publish_start - previous_publish_start) * 1000.0
                 - timing_rows[-1]["wait_ms"]
             )
-        current_chart.command_builder.publish(mnt, block=False)
+        command_end = len(current_chart._commands)
+        sent_content = current_chart.command_builder.publish(mnt, block=False)
         publish_end = time.perf_counter()
+        sent_batches.append(
+            (len(timing_rows) + 1, sent_content, command_start, command_end)
+        )
+        command_start = command_end
         previous_publish_start = publish_start
         previous_publish_end = publish_end
         wait_time = _get_wait_time()
@@ -1935,6 +1943,30 @@ def play_song(context=None):
     except Exception:
         logging.exception("保存打歌时序明细失败")
     time.sleep(2)
+    with cmd_log_list_lock:
+        device_events = list(cmd_log_list)
+    try:
+        device_path, device_stats = save_device_report(
+            sent_batches, current_chart._commands, current_chart.actions,
+            device_events, current_song_id, DIFFICULTY,
+        )
+        drift_text = "未取得有效提交"
+        if device_stats["commits"]:
+            drift_text = "范围 %.3f～%.3fms, 末次 %.3f～%.3fms" % (
+                device_stats["min_drift_ms"], device_stats["max_drift_ms"],
+                device_stats["last_drift_min_ms"], device_stats["last_drift_max_ms"],
+            )
+        logging.info(
+            "设备时序: 预期 %d 条, 回调 %d 条, 顺序匹配 %d 条, "
+            "首个不一致 %s, 动作映射异常 %d 批, 有效提交 %d; "
+            "相对漂移%s; 逐条明细: %s",
+            device_stats["expected"], device_stats["received"],
+            device_stats["matched"], device_stats["first_mismatch"] or "无",
+            device_stats["invalid_batches"], device_stats["commits"],
+            drift_text, device_path,
+        )
+    except Exception:
+        logging.exception("保存设备执行时序明细失败")
 
 
 def wait_first_note():

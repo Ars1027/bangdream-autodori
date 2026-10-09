@@ -237,6 +237,75 @@ def test_slide_slice_boundaries():
               tuple(round(v) for v in slide_moves[-1]["to"]) == (642, 590))
 
 
+def test_bpm_markers_preloaded_before_note_conversion():
+    """Long/Slide connections use all markers regardless of chart array order."""
+    print("\n[8] BPM 预加载与 connection 时间")
+
+    # The Long and Slide precede their future BPM records in array order.
+    # Their timing must still use 120 BPM from beat 0 and 60 BPM from beat 4.
+    one_marker = build([
+        {"type": "Long", "connections": [
+            {"lane": 1, "beat": 3}, {"lane": 2, "beat": 5}]},
+        {"type": "BPM", "bpm": 120, "beat": 0},
+        {"type": "BPM", "bpm": 60, "beat": 4},
+        {"type": "Slide", "connections": [
+            {"lane": 3, "beat": 3}, {"lane": 4, "beat": 5}]},
+    ])
+    long_connections = one_marker._chart_data[0]["connections"]
+    slide_connections = one_marker._chart_data[3]["connections"]
+    check("未来单个 BPM marker 正确转换 Long 两端",
+          [c["time"] for c in long_connections] == [1500.0, 3000.0],
+          "实际 %s" % [c["time"] for c in long_connections])
+    check("未来单个 BPM marker 正确转换 Slide 两端",
+          [c["time"] for c in slide_connections] == [1500.0, 3000.0],
+          "实际 %s" % [c["time"] for c in slide_connections])
+
+    # Multiple markers are out of beat order in the source data. Markers at
+    # the same beat retain source order, so the last one (60 BPM) takes effect.
+    multiple_markers = build([
+        {"type": "Slide", "connections": [
+            {"lane": 0, "beat": 3}, {"lane": 6, "beat": 9}]},
+        {"type": "Long", "connections": [
+            {"lane": 1, "beat": 3}, {"lane": 5, "beat": 9}]},
+        {"type": "BPM", "bpm": 120, "beat": 4},
+        {"type": "BPM", "bpm": 60, "beat": 0},
+        {"type": "Single", "lane": 2, "beat": 6},
+        {"type": "BPM", "bpm": 60, "beat": 4},
+        {"type": "BPM", "bpm": 120, "beat": 8},
+    ])
+    slide_connections = multiple_markers._chart_data[0]["connections"]
+    long_connections = multiple_markers._chart_data[1]["connections"]
+    single = multiple_markers._chart_data[4]
+    check("多段且乱序 BPM marker 正确转换跨段 Slide",
+          [c["time"] for c in slide_connections] == [3000.0, 8500.0],
+          "实际 %s" % [c["time"] for c in slide_connections])
+    check("多段且乱序 BPM marker 正确转换跨段 Long",
+          [c["time"] for c in long_connections] == [3000.0, 8500.0],
+          "实际 %s" % [c["time"] for c in long_connections])
+    check("同拍 marker 保持稳定顺序,最后的 60 BPM 生效",
+          single["time"] == 6000.0,
+          "实际 %s" % single["time"])
+    check("BPM 预加载不改变原始 note index 顺序",
+          [multiple_markers._chart_data[i]["index"] for i in (0, 1, 4)] == [0, 1, 2],
+          "Slide=%s Single=%s" % (
+              multiple_markers._chart_data[0]["index"], single["index"]))
+    check("BPM 预加载保留原始 checkpoint index 顺序",
+          [c["checkpoint_index"] for c in slide_connections + long_connections]
+          + [single["checkpoint_index"]] == [0, 1, 2, 3, 4])
+
+    # A marker at the connection beat applies at that boundary.
+    boundary = build([
+        {"type": "Long", "connections": [
+            {"lane": 1, "beat": 4}, {"lane": 2, "beat": 5}]},
+        {"type": "BPM", "bpm": 120, "beat": 0},
+        {"type": "BPM", "bpm": 60, "beat": 4},
+    ])
+    boundary_connections = boundary._chart_data[0]["connections"]
+    check("connection 正好位于 BPM 边界时使用新 BPM",
+          [c["time"] for c in boundary_connections] == [2000.0, 3000.0],
+          "实际 %s" % [c["time"] for c in boundary_connections])
+
+
 def main():
     test_zero_length_segment()
     test_normal_slide_not_broken()
@@ -245,6 +314,7 @@ def main():
     test_long_and_flick_untouched()
     test_slide_tail_rounding_and_finger_reuse()
     test_slide_slice_boundaries()
+    test_bpm_markers_preloaded_before_note_conversion()
     print("\n合计: %d 通过 / %d 失败" % (PASS, FAIL))
     return 1 if FAIL else 0
 
