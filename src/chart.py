@@ -436,6 +436,7 @@ class Chart:
                     "action": action,
                 }
             )
+            self._a2c_offset += interval_offset
 
         def round_tuple(target):
             return tuple(round(x) for x in target)
@@ -444,8 +445,6 @@ class Chart:
         for i, action in enumerate(actions):
             action_type = action["type"]
             action_index = action["index"]
-
-            self._a2c_offset += interval_offset
 
             if action_type == "down":
                 self._a2c_offset += down_offset
@@ -508,6 +507,8 @@ class Chart:
                     append(builder.commit())
                     append(builder.wait(rounded_waitfor))
 
+        # publish() 会额外补一条 commit，其间隔由后续 wait 消化。
+        self._a2c_offset += interval_offset
         self.actions_to_cmd_index += size
 
     def dump_debug_config(self):
